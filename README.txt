@@ -1,0 +1,1 @@
+Dê dois cliques em 'instalar_e_executar.bat' para instalar tudo e rodar o bot.
