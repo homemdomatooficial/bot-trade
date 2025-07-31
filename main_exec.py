@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import os
 import re
 import emoji
@@ -21,10 +24,11 @@ SIGNALS_GROUP_ID   = int(os.getenv('SIGNALS_GROUP_ID', '-4845548770'))
 client = TelegramClient('bot_session', API_ID, API_HASH)
 fut    = UMFutures(key=BINANCE_API_KEY, secret=BINANCE_API_SECRET)
 
-# Armazena SLs, preços de entrada e side original
-stop_order_ids = {}
-entry_prices_map = {}
-original_sides = {}
+# Armazena SLs, preços de entrada, side original e tipo de entrada
+stop_order_ids    = {}
+entry_prices_map  = {}
+original_sides    = {}
+entry_order_types = {}
 
 # ─── Helpers ───
 def remove_emojis(text: str) -> str:
@@ -122,22 +126,23 @@ async def main():
     @client.on(events.NewMessage(chats=SIGNALS_GROUP_ID))
     async def handler(event):
         text = event.raw_text
-        # 0) Detecta apenas "Take-profit target 3 ✅"
+
+        # 0) Take-profit target 3 ✅
         m_tp3 = re.search(r'#([A-Z0-9]+)/USDT\s+Take-profit target 3\s+✅', text)
         if m_tp3:
             symbol = m_tp3.group(1) + 'USDT'
             print(f'🔔 Comando Take-profit target 3 recebido para {symbol}')
-            # Cancela SL atual
             if symbol in stop_order_ids:
                 try:
                     fut.cancel_order(symbol=symbol, orderId=stop_order_ids[symbol])
                     print(f'▶ Stop-loss cancelado para {symbol} (id {stop_order_ids[symbol]})')
                 except ClientError as e:
                     print('❌ Erro ao cancelar SL:', e)
-            # Cria novo SL break-even
-            if symbol in entry_prices_map and symbol in original_sides:
+            # só SL break-even se foi MARKET
+            if symbol in entry_prices_map and symbol in original_sides and entry_order_types.get(symbol)=='MARKET':
                 entry_p = entry_prices_map[symbol]
-                sl_price = adjust_precision(symbol, entry_p, 'price')
+                factor = 1 + (0.001 if original_sides[symbol]=='BUY' else -0.001)
+                sl_price = adjust_precision(symbol, entry_p * factor, 'price')
                 opposite = 'SELL' if original_sides[symbol]=='BUY' else 'BUY'
                 try:
                     new_sl = fut.new_order(
@@ -148,16 +153,18 @@ async def main():
                         closePosition=True
                     )
                     stop_order_ids[symbol] = new_sl['orderId']
-                    print(f'▶ Novo stop-loss break-even @ {sl_price} (id {new_sl["orderId"]})')
+                    print(f'▶ Novo SL break-even @ {sl_price} (id {new_sl["orderId"]})')
                 except ClientError as e:
                     print('❌ Erro ao agendar novo SL:', e)
             return
 
-        # 1) Processa sinal de entrada normalmente
+        # 1) Sinal de entrada
         parsed = parse_message(text)
         if not parsed:
             print('⚠️ Fora do padrão:', text)
             return
+        # remove zeros de TPs
+        parsed['tps'] = [tp for tp in parsed['tps'] if tp>0]
         print('✅ Sinal válido:', parsed)
 
         # Ajusta alavancagem
@@ -171,41 +178,35 @@ async def main():
         qty = max(adjust_precision(parsed['symbol'], raw_qty, 'quantity'), get_min_quantity(parsed['symbol']))
         print(f'▶ Qty calculada: {qty} (margem US$ {margin:.2f}, lev {parsed["leverage"]}x)')
 
-        # Cria ordem de entrada com proximidade de 0.05%
-        threshold = entry_price * 0.0005  # 0.05%
+        # Cria entrada
+        threshold = entry_price * 0.0005
         mark = float(fut.mark_price(symbol=parsed['symbol'])['markPrice'])
         side = parsed['side']
         try:
             if side=='BUY':
                 if mark >= entry_price - threshold:
                     entry = fut.new_order(symbol=parsed['symbol'], side='BUY', type='MARKET', quantity=qty)
-                    print(f'▶ Entrada BUY MARKET (id {entry["orderId"]}) @ {mark}')
                 else:
-                    entry = fut.new_order(
-                        symbol=parsed['symbol'], side='BUY', type='STOP',
-                        quantity=qty, price=str(entry_price), stopPrice=str(entry_price), timeInForce='GTC'
-                    )
-                    print(f'▶ Entrada BUY STOP-LIMIT (id {entry["orderId"]}) @{entry_price}')
+                    entry = fut.new_order(symbol=parsed['symbol'], side='BUY', type='STOP', quantity=qty,
+                                           price=str(entry_price), stopPrice=str(entry_price), timeInForce='GTC')
             else:
                 if mark <= entry_price + threshold:
                     entry = fut.new_order(symbol=parsed['symbol'], side='SELL', type='MARKET', quantity=qty)
-                    print(f'▶ Entrada SELL MARKET (id {entry["orderId"]}) @ {mark}')
                 else:
-                    entry = fut.new_order(
-                        symbol=parsed['symbol'], side='SELL', type='STOP',
-                        quantity=qty, price=str(entry_price), stopPrice=str(entry_price), timeInForce='GTC'
-                    )
-                    print(f'▶ Entrada SELL STOP-LIMIT (id {entry["orderId"]}) @{entry_price}')
-            entry_id = entry['orderId']
+                    entry = fut.new_order(symbol=parsed['symbol'], side='SELL', type='STOP', quantity=qty,
+                                           price=str(entry_price), stopPrice=str(entry_price), timeInForce='GTC')
+            print(f'▶ Entrada {side} {entry["type"]} (id {entry["orderId"]})')
+            entry_order_types[parsed['symbol']] = entry['type']
         except ClientError as e:
             print('❌ Erro na entrada:', e)
             return
 
-        # Agenda SL sempre STOP_MARKET e armazena
+        # Agenda SL original
         opposite = 'SELL' if side=='BUY' else 'BUY'
         sl_price = adjust_precision(parsed['symbol'], parsed['stop'], 'price')
         try:
-            sl = fut.new_order(symbol=parsed['symbol'], side=opposite, type='STOP_MARKET', stopPrice=str(sl_price), closePosition=True)
+            sl = fut.new_order(symbol=parsed['symbol'], side=opposite, type='STOP_MARKET',
+                               stopPrice=str(sl_price), closePosition=True)
             print(f'▶ STOP-LOSS agendado @ {sl_price} (id {sl["orderId"]})')
             stop_order_ids[parsed['symbol']] = sl['orderId']
             entry_prices_map[parsed['symbol']] = entry_price
@@ -213,19 +214,20 @@ async def main():
         except ClientError as e:
             print('❌ Erro ao agendar SL:', e)
 
-        # Agenda apenas TPs 1 a 6
+        # Agenda TPs 1-6
         remaining = qty
         for i, tpv in enumerate(parsed['tps'], start=1):
             if i>6:
-                print(f'⚠️ Ignorando TP{i} (fechamento manual)')
+                print(f'⚠️ Ignorando TP{i} (manual)')
                 continue
             sell_qty = adjust_precision(parsed['symbol'], remaining*0.2, 'quantity')
-            if sell_qty<=0:
-                continue
+            if sell_qty<=0: continue
             tp_price = adjust_precision(parsed['symbol'], tpv, 'price')
             try:
-                fut.new_order(symbol=parsed['symbol'], side=opposite, type='TAKE_PROFIT_MARKET', stopPrice=str(tp_price), quantity=sell_qty, reduceOnly=True)
-                print(f'▶ TP{i} agendado @ {tp_price} qty {sell_qty} (rest {remaining})')
+                fut.new_order(symbol=parsed['symbol'], side=opposite,
+                              type='TAKE_PROFIT_MARKET', stopPrice=str(tp_price),
+                              quantity=sell_qty, reduceOnly=True)
+                print(f'▶ TP{i} @ {tp_price} qty {sell_qty}')
                 remaining -= sell_qty
             except ClientError as e:
                 print(f'❌ Erro TP{i}:', e)
