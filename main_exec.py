@@ -5,9 +5,12 @@ import re
 import emoji
 import math
 import asyncio
+from dotenv import load_dotenv           # ← adicionado
+load_dotenv()                            # ← adicionado
 from telethon import TelegramClient, events
 from binance.um_futures import UMFutures
 from binance.error import ClientError
+
 
 # ─────────── AUTOCARGA DE .env ───────────
 # Carrega variáveis do .env automaticamente
