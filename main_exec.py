@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
 
-from dotenv import load_dotenv
-load_dotenv()
-
 import os
 import re
 import emoji
@@ -24,11 +21,9 @@ SIGNALS_GROUP_ID   = int(os.getenv('SIGNALS_GROUP_ID', '-4845548770'))
 client = TelegramClient('bot_session', API_ID, API_HASH)
 fut    = UMFutures(key=BINANCE_API_KEY, secret=BINANCE_API_SECRET)
 
-# Armazena SLs, preços de entrada, side original e tipo de entrada
-stop_order_ids    = {}
-entry_prices_map  = {}
-original_sides    = {}
-entry_order_types = {}
+stop_order_ids   = {}
+entry_prices_map = {}
+original_sides   = {}
 
 # ─── Helpers ───
 def remove_emojis(text: str) -> str:
@@ -44,79 +39,85 @@ def parse_message(text: str):
     tps = []
     stop = None
     entry_block = tp_block = stop_block = False
-    for line in lines:
-        ln = line.strip()
+
+    for ln in [l.strip() for l in lines]:
         if not ln or ln.lower().startswith('exchanges:'):
             continue
+
         m = re.search(r'#([A-Z0-9]+)/USDT', ln)
         if m:
             symbol = m.group(1) + 'USDT'
             continue
+
         if 'Signal Type' in ln:
             m = re.search(r'\b(Long|Short)\b', ln, re.IGNORECASE)
-            if m:
-                side = 'BUY' if m.group(1).lower()=='long' else 'SELL'
+            side = 'BUY' if m and m.group(1).lower()=='long' else ('SELL' if m else side)
             continue
+
         if 'Leverage' in ln:
             m = re.search(r'(\d+)[xх]', ln)
-            if m:
-                leverage = int(m.group(1))
+            if m: leverage = int(m.group(1))
             continue
+
         if ln.lower().startswith('entry targets'):
             entry_block = True
             continue
         if entry_block:
-            try:
-                entry = float(ln)
-            except:
-                pass
+            try: entry = float(ln)
+            except: pass
             entry_block = False
             continue
+
         if ln.lower().startswith('take-profit targets'):
             tp_block = True
             continue
         if tp_block:
-            if ln.startswith('🚀'):
-                continue
             m = re.search(r'\d+\)\s*([\d.]+)', ln)
             if m:
-                tps.append(float(m.group(1)))
+                val = float(m.group(1))
+                if val>0: tps.append(val)
                 continue
             tp_block = False
+
         if 'STOP' in ln.upper():
             stop_block = True
             continue
         if stop_block:
-            try:
-                stop = float(ln)
-            except:
-                pass
+            try: stop = float(ln)
+            except: pass
             stop_block = False
             continue
+
     if None in (symbol, side, entry, stop) or not tps:
         return None
-    return {'symbol': symbol, 'side': side, 'leverage': leverage, 'entry': entry, 'tps': tps, 'stop': stop}
+    return {'symbol':symbol,'side':side,'leverage':leverage,'entry':entry,'tps':tps,'stop':stop}
 
-# ─── Ajuste de precisão ───
-def adjust_precision(symbol: str, value: float, value_type: str = 'price') -> float:
+# ─── Precision & filtros ───
+def adjust_precision(symbol: str, value: float, value_type: str='price') -> float:
     info = fut.exchange_info()
     si = next(s for s in info['symbols'] if s['symbol']==symbol)
-    filt_type = 'PRICE_FILTER' if value_type=='price' else 'LOT_SIZE'
-    filt = next(f for f in si['filters'] if f['filterType']==filt_type)
-    step = float(filt['tickSize'] if value_type=='price' else filt['stepSize'])
-    prec = int(-math.floor(math.log10(step)))
+    ftype = 'PRICE_FILTER' if value_type=='price' else 'LOT_SIZE'
+    filt  = next(f for f in si['filters'] if f['filterType']==ftype)
+    step  = float(filt['tickSize'] if value_type=='price' else filt['stepSize'])
+    prec  = int(-math.floor(math.log10(step)))
     if value_type=='quantity':
         q = math.floor(value/step)*step
         return round(q, prec)
     return round(value, prec)
 
-# ─── Saldo e minQty ───
 def get_balance() -> float:
     return float(next(x for x in fut.balance() if x['asset']=='USDT')['balance'])
 
 def get_min_quantity(symbol: str) -> float:
     si = next(s for s in fut.exchange_info()['symbols'] if s['symbol']==symbol)
     return float(next(f for f in si['filters'] if f['filterType']=='LOT_SIZE')['minQty'])
+
+def get_tick(symbol: str) -> float:
+    # para ajuste fino do stopPrice
+    info = fut.exchange_info()
+    si = next(s for s in info['symbols'] if s['symbol']==symbol)
+    tick = float(next(f for f in si['filters'] if f['filterType']=='PRICE_FILTER')['tickSize'])
+    return tick
 
 # ─── Main ───────
 async def main():
@@ -125,114 +126,117 @@ async def main():
 
     @client.on(events.NewMessage(chats=SIGNALS_GROUP_ID))
     async def handler(event):
-        text = event.raw_text
-
-        # 0) Take-profit target 3 ✅
-        m_tp3 = re.search(r'#([A-Z0-9]+)/USDT\s+Take-profit target 3\s+✅', text)
-        if m_tp3:
-            symbol = m_tp3.group(1) + 'USDT'
-            print(f'🔔 Comando Take-profit target 3 recebido para {symbol}')
-            if symbol in stop_order_ids:
+        txt = event.raw_text
+        # 0) TP3 manual
+        if re.search(r'#([A-Z0-9]+)/USDT\s+Take-profit target 3\s+✅', txt):
+            sym = re.search(r'#([A-Z0-9]+)/USDT', txt).group(1)+'USDT'
+            print(f'🔔 Ajustando BE para {sym}')
+            if sym in stop_order_ids:
                 try:
-                    fut.cancel_order(symbol=symbol, orderId=stop_order_ids[symbol])
-                    print(f'▶ Stop-loss cancelado para {symbol} (id {stop_order_ids[symbol]})')
+                    fut.cancel_order(symbol=sym, orderId=stop_order_ids[sym])
+                    print(f'▶ SL {sym} cancelado')
                 except ClientError as e:
-                    print('❌ Erro ao cancelar SL:', e)
-            # só SL break-even se foi MARKET
-            if symbol in entry_prices_map and symbol in original_sides and entry_order_types.get(symbol)=='MARKET':
-                entry_p = entry_prices_map[symbol]
-                factor = 1 + (0.001 if original_sides[symbol]=='BUY' else -0.001)
-                sl_price = adjust_precision(symbol, entry_p * factor, 'price')
-                opposite = 'SELL' if original_sides[symbol]=='BUY' else 'BUY'
+                    print('❌', e)
+            if sym in entry_prices_map and sym in original_sides:
+                ep = entry_prices_map[sym]
+                sp = adjust_precision(sym, ep, 'price')
+                opp = 'SELL' if original_sides[sym]=='BUY' else 'BUY'
                 try:
-                    new_sl = fut.new_order(
-                        symbol=symbol,
-                        side=opposite,
-                        type='STOP_MARKET',
-                        stopPrice=str(sl_price),
-                        closePosition=True
-                    )
-                    stop_order_ids[symbol] = new_sl['orderId']
-                    print(f'▶ Novo SL break-even @ {sl_price} (id {new_sl["orderId"]})')
+                    newsl = fut.new_order(symbol=sym, side=opp, type='STOP_MARKET',
+                                          stopPrice=str(sp), closePosition=True, reduceOnly=True)
+                    stop_order_ids[sym] = newsl['orderId']
+                    print(f'▶ SL BE @ {sp}')
                 except ClientError as e:
-                    print('❌ Erro ao agendar novo SL:', e)
+                    print('❌', e)
             return
 
-        # 1) Sinal de entrada
-        parsed = parse_message(text)
+        # 1) Sinal novo
+        parsed = parse_message(txt)
         if not parsed:
-            print('⚠️ Fora do padrão:', text)
+            print('⚠️ Fora do padrão:', txt)
             return
-        # remove zeros de TPs
-        parsed['tps'] = [tp for tp in parsed['tps'] if tp>0]
         print('✅ Sinal válido:', parsed)
 
-        # Ajusta alavancagem
+        # Alavancagem
         fut.change_leverage(symbol=parsed['symbol'], leverage=parsed['leverage'])
 
-        # Calcula qty
-        balance = get_balance()
-        margin = min(balance * 0.01, 30)
-        entry_price = adjust_precision(parsed['symbol'], parsed['entry'], 'price')
-        raw_qty = (margin * parsed['leverage']) / entry_price
-        qty = max(adjust_precision(parsed['symbol'], raw_qty, 'quantity'), get_min_quantity(parsed['symbol']))
-        print(f'▶ Qty calculada: {qty} (margem US$ {margin:.2f}, lev {parsed["leverage"]}x)')
+        # Qtd
+        bal    = get_balance()
+        margin = min(bal*0.01, 30)
+        ep     = adjust_precision(parsed['symbol'], parsed['entry'], 'price')
+        rawq   = (margin*parsed['leverage'])/ep
+        qty    = max(adjust_precision(parsed['symbol'], rawq, 'quantity'),
+                     get_min_quantity(parsed['symbol']))
+        print(f'▶ Qty: {qty} (margem {margin:.2f}, lev {parsed["leverage"]}x)')
 
-        # Cria entrada
-        threshold = entry_price * 0.0005
-        mark = float(fut.mark_price(symbol=parsed['symbol'])['markPrice'])
-        side = parsed['side']
+        # Entrada
+        th    = ep*0.0005
+        markp = float(fut.mark_price(symbol=parsed['symbol'])['markPrice'])
+        side  = parsed['side']
+        opp   = 'SELL' if side=='BUY' else 'BUY'
         try:
             if side=='BUY':
-                if mark >= entry_price - threshold:
-                    entry = fut.new_order(symbol=parsed['symbol'], side='BUY', type='MARKET', quantity=qty)
+                if markp>=ep-th:
+                    ent = fut.new_order(symbol=parsed['symbol'], side='BUY', type='MARKET', quantity=qty)
+                    print(f'▶ BUY MARKET @ {markp}')
                 else:
-                    entry = fut.new_order(symbol=parsed['symbol'], side='BUY', type='STOP', quantity=qty,
-                                           price=str(entry_price), stopPrice=str(entry_price), timeInForce='GTC')
+                    ent = fut.new_order(symbol=parsed['symbol'], side='BUY', type='STOP',
+                                        quantity=qty, price=str(ep), stopPrice=str(ep), timeInForce='GTC')
+                    print(f'▶ BUY STOP-LIMIT @ {ep}')
             else:
-                if mark <= entry_price + threshold:
-                    entry = fut.new_order(symbol=parsed['symbol'], side='SELL', type='MARKET', quantity=qty)
+                if markp<=ep+th:
+                    ent = fut.new_order(symbol=parsed['symbol'], side='SELL', type='MARKET', quantity=qty)
+                    print(f'▶ SELL MARKET @ {markp}')
                 else:
-                    entry = fut.new_order(symbol=parsed['symbol'], side='SELL', type='STOP', quantity=qty,
-                                           price=str(entry_price), stopPrice=str(entry_price), timeInForce='GTC')
-            print(f'▶ Entrada {side} {entry["type"]} (id {entry["orderId"]})')
-            entry_order_types[parsed['symbol']] = entry['type']
+                    ent = fut.new_order(symbol=parsed['symbol'], side='SELL', type='STOP',
+                                        quantity=qty, price=str(ep), stopPrice=str(ep), timeInForce='GTC')
+                    print(f'▶ SELL STOP-LIMIT @ {ep}')
+            entry_prices_map[parsed['symbol']] = ep
+            original_sides[parsed['symbol']]   = side
         except ClientError as e:
             print('❌ Erro na entrada:', e)
             return
 
-        # Agenda SL original
-        opposite = 'SELL' if side=='BUY' else 'BUY'
-        sl_price = adjust_precision(parsed['symbol'], parsed['stop'], 'price')
+        # SL com retry caso -2021
+        sp = adjust_precision(parsed['symbol'], parsed['stop'], 'price')
         try:
-            sl = fut.new_order(symbol=parsed['symbol'], side=opposite, type='STOP_MARKET',
-                               stopPrice=str(sl_price), closePosition=True)
-            print(f'▶ STOP-LOSS agendado @ {sl_price} (id {sl["orderId"]})')
-            stop_order_ids[parsed['symbol']] = sl['orderId']
-            entry_prices_map[parsed['symbol']] = entry_price
-            original_sides[parsed['symbol']] = side
+            sl = fut.new_order(symbol=parsed['symbol'], side=opp, type='STOP_MARKET',
+                               stopPrice=str(sp), closePosition=True, reduceOnly=True)
         except ClientError as e:
-            print('❌ Erro ao agendar SL:', e)
+            if e.code==-2021:
+                # ajusta em um tick
+                tick = get_tick(parsed['symbol'])
+                sp = sp + tick if side=='BUY' else sp - tick
+                sp = adjust_precision(parsed['symbol'], sp, 'price')
+                try:
+                    sl = fut.new_order(symbol=parsed['symbol'], side=opp, type='STOP_MARKET',
+                                       stopPrice=str(sp), closePosition=True, reduceOnly=True)
+                    print(f'▶ SL (ajustado) @ {sp}')
+                except ClientError as e2:
+                    print('❌ SL falhou após ajuste:', e2)
+                    sl = None
+            else:
+                print('❌ Erro ao agendar SL:', e)
+                sl = None
+        if sl:
+            stop_order_ids[parsed['symbol']] = sl['orderId']
+            print(f'▶ SL agendado @ {sp}')
 
-        # Agenda TPs 1-6
-        remaining = qty
-        for i, tpv in enumerate(parsed['tps'], start=1):
-            if i>6:
-                print(f'⚠️ Ignorando TP{i} (manual)')
-                continue
-            sell_qty = adjust_precision(parsed['symbol'], remaining*0.2, 'quantity')
-            if sell_qty<=0: continue
-            tp_price = adjust_precision(parsed['symbol'], tpv, 'price')
+        # TPs 1–6
+        rem = qty
+        for i, tv in enumerate(parsed['tps'][:6], start=1):
+            qli = adjust_precision(parsed['symbol'], rem*0.2, 'quantity')
+            if qli<=0: break
+            tp_p = adjust_precision(parsed['symbol'], tv, 'price')
             try:
-                fut.new_order(symbol=parsed['symbol'], side=opposite,
-                              type='TAKE_PROFIT_MARKET', stopPrice=str(tp_price),
-                              quantity=sell_qty, reduceOnly=True)
-                print(f'▶ TP{i} @ {tp_price} qty {sell_qty}')
-                remaining -= sell_qty
+                fut.new_order(symbol=parsed['symbol'], side=opp, type='TAKE_PROFIT_MARKET',
+                              stopPrice=str(tp_p), quantity=qli, reduceOnly=True)
+                print(f'▶ TP{i} @ {tp_p} qty {qli}')
+                rem -= qli
             except ClientError as e:
                 print(f'❌ Erro TP{i}:', e)
 
     await client.run_until_disconnected()
 
-if __name__ == '__main__':
+if __name__=='__main__':
     asyncio.run(main())
